@@ -15,7 +15,9 @@
 package types
 
 import (
+	"bytes"
 	"maps"
+	"slices"
 
 	digest "github.com/sudo-bmitch/oci-digest"
 )
@@ -51,11 +53,12 @@ type Descriptor struct {
 }
 
 // annotationVal returns a value from the annotations, or an empty string if unset.
-func (d Descriptor) annotationVal(key string) string {
+func (d Descriptor) AnnotationVal(key string) (string, bool) {
 	if d.Annotations == nil {
-		return ""
+		return "", false
 	}
-	return d.Annotations[key]
+	val, ok := d.Annotations[key]
+	return val, ok
 }
 
 // Copy returns a copy of the descriptor
@@ -78,4 +81,64 @@ func (d Descriptor) Copy() Descriptor {
 		maps.Copy(d2.Annotations, d.Annotations)
 	}
 	return d2
+}
+
+// Equal returns true if the two descriptors are identical.
+func (d Descriptor) Equal(d2 Descriptor) bool {
+	if d.MediaType != d2.MediaType || d.Size != d2.Size || d.ArtifactType != d2.ArtifactType ||
+		!d.Digest.Equal(d2.Digest) || !bytes.Equal(d.Data, d2.Data) ||
+		(d.Platform != d2.Platform && (d.Platform == nil || d2.Platform == nil || !d.Platform.Equal(*d2.Platform))) ||
+		!maps.Equal(d.Annotations, d2.Annotations) || !slices.Equal(d.URLs, d2.URLs) {
+		return false
+	}
+	return true
+}
+
+// Same returns true if the two descriptors are for the same content.
+// This ignores timestamp differences in the creation time annotation.
+func (d Descriptor) Same(d2 Descriptor) bool {
+	if d.MediaType != d2.MediaType || d.Size != d2.Size || d.ArtifactType != d2.ArtifactType ||
+		!d.Digest.Equal(d2.Digest) || !bytes.Equal(d.Data, d2.Data) ||
+		(d.Platform != d2.Platform && (d.Platform == nil || d2.Platform == nil || !d.Platform.Equal(*d2.Platform))) ||
+		!slices.Equal(d.URLs, d2.URLs) {
+		return false
+	}
+	a1 := d.Annotations
+	if a1 == nil {
+		a1 = map[string]string{}
+	}
+	a2 := d2.Annotations
+	if a2 == nil {
+		a2 = map[string]string{}
+	}
+	c1 := len(a1)
+	if _, ok := a1[AnnotCreated]; !ok {
+		c1++
+	}
+	c2 := len(a2)
+	if _, ok := a2[AnnotCreated]; !ok {
+		c2++
+	}
+	if c1 != c2 {
+		return false
+	}
+	for k, v := range a1 {
+		if a2[k] != v && k != AnnotCreated {
+			return false
+		}
+	}
+	return true
+}
+
+func AnnotationsEmpty(d Descriptor) bool {
+	for k := range d.Annotations {
+		switch k {
+		// list annotations excluded from an empty check here
+		case AnnotCreated:
+			// ignore
+		default:
+			return false
+		}
+	}
+	return true
 }

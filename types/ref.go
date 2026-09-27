@@ -16,5 +16,13 @@ package types
 
 import "regexp"
 
-// RefTagRE is a regexp for a valid tag.
-var RefTagRE = regexp.MustCompile(`^[a-zA-Z0-9_][a-zA-Z0-9._-]{0,127}$`)
+var pathPart = `[a-z0-9]+(?:(?:\.|_|__|-+)[a-z0-9]+)*`
+
+var (
+	// PathPartRE is regexp for a subdirectory in a repository name
+	PathPartRE = regexp.MustCompile(`^` + pathPart + `$`)
+	// PathRE is the regexp for a full repository path
+	PathRE = regexp.MustCompile(`^` + pathPart + `(?:\/` + pathPart + `)*$`)
+	// RefTagRE is a regexp for a valid tag.
+	RefTagRE = regexp.MustCompile(`^[a-zA-Z0-9_][a-zA-Z0-9._-]{0,127}$`)
+)

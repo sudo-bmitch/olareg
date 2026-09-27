@@ -12,21 +12,4 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package config
-
-import "testing"
-
-func TestSetDefaults(t *testing.T) {
-	c := Config{Storage: ConfigStorage{StoreType: StoreDir}}
-	c.SetDefaults()
-	if c.API.DeleteEnabled == nil || c.API.PushEnabled == nil || c.API.Blob.DeleteEnabled == nil ||
-		c.API.Referrer.Enabled == nil || c.Storage.ReadOnly == nil {
-		t.Errorf("bool default values should not be nil")
-	}
-	if c.API.Manifest.Limit == 0 {
-		t.Errorf("manifest limit should not be zero")
-	}
-	if c.Storage.RootDir == "" {
-		t.Errorf("rootDir should not be empty for StoreDir")
-	}
-}
+package backend

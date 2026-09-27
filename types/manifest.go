@@ -68,7 +68,7 @@ type Manifest struct {
 	Annotations map[string]string `json:"annotations,omitempty"`
 }
 
-// Copy returns a deep copy of the index to avoid data races
+// Copy returns a deep copy of the index.
 func (i Index) Copy() Index {
 	i2 := i
 	i2.Manifests = make([]Descriptor, len(i.Manifests))
@@ -113,6 +113,7 @@ type referrerParse struct {
 // ManifestReferrerDescriptor parses a manifest to generate the descriptor used in the referrer response.
 // Two descriptors are returned, the subject, and the entry for the referrers response.
 // The descriptor should be provided with a valid MediaType and Digest, otherwise they will be generated as a best effort.
+// If the manifest does not contain a subject, [ErrNotFOund] is returned.
 func ManifestReferrerDescriptor(raw []byte, d Descriptor) (Descriptor, Descriptor, error) {
 	rd := d
 	subject := Descriptor{}
@@ -144,3 +145,38 @@ func ManifestReferrerDescriptor(raw []byte, d Descriptor) (Descriptor, Descripto
 	rd.Annotations = referrer.Annotations
 	return subject, rd, nil
 }
+
+// ManifestParseDescriptors reads the contents of a manifest and returns the contained descriptors up to the requested depth.
+// Note that the subject descriptor is not returned at any depth.
+// TODO: add tests
+func ManifestParseDescriptors(raw []byte, d Descriptor, depth ManifestParseDepth) ([]Descriptor, error) {
+	switch d.MediaType {
+	case MediaTypeOCI1ManifestList, MediaTypeDocker2ManifestList:
+		if depth >= ParseManifests {
+			ind := Index{}
+			err := json.Unmarshal(raw, &ind)
+			if err != nil {
+				return nil, err
+			}
+			return ind.Manifests, nil
+		}
+	case MediaTypeOCI1Manifest, MediaTypeDocker2Manifest:
+		if depth >= ParseBlobs {
+			man := Manifest{}
+			err := json.Unmarshal(raw, &man)
+			if err != nil {
+				return nil, err
+			}
+			return append(man.Layers, man.Config), nil
+		}
+	}
+	return nil, nil
+}
+
+type ManifestParseDepth int
+
+const (
+	ParseNone      ManifestParseDepth = iota // Do not parse any descriptors
+	ParseManifests                           // Parse and return only descriptors to other manifests in the index
+	ParseBlobs                               // Parse and return descriptors to manifest and other blobs
+)

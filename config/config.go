@@ -16,10 +16,8 @@
 package config
 
 import (
-	"fmt"
 	"log/slog"
 	"net/http"
-	"strings"
 	"time"
 )
 
@@ -32,13 +30,12 @@ const (
 	authDescription            = "olareg registry"
 )
 
-type Store int
+type Store = string // preserving for backwards compatibility
 
 const (
-	StoreUndef  Store = iota // undefined backend storage is the invalid zero value
-	StoreMem                 // StoreMem only uses memory for an ephemeral registry
-	StoreDir                 // StoreDir tracks each repository with a separate blob store
-	StoreShared              // StoreShared tracks the blobs in a single store for less disk usage
+	StoreUndef = ""    // undefined backend storage is the invalid zero value
+	StoreMem   = "mem" // StoreMem only uses memory for an ephemeral registry
+	StoreDir   = "dir" // StoreDir tracks each repository with a separate blob store
 )
 
 type Config struct {
@@ -152,34 +149,4 @@ func boolDefault(cur *bool, def bool) *bool {
 		return cur
 	}
 	return &def
-}
-
-func (s Store) MarshalText() ([]byte, error) {
-	var ret string
-	switch s {
-	case StoreMem:
-		ret = "mem"
-	case StoreDir:
-		ret = "dir"
-	case StoreShared:
-		ret = "shared"
-	}
-	if ret == "" {
-		return []byte{}, fmt.Errorf("unknown store value %d", int(s))
-	}
-	return []byte(ret), nil
-}
-
-func (s *Store) UnmarshalText(b []byte) error {
-	switch strings.ToLower(string(b)) {
-	default:
-		return fmt.Errorf("unknown store value \"%s\"", b)
-	case "mem":
-		*s = StoreMem
-	case "dir":
-		*s = StoreDir
-	case "shared":
-		*s = StoreShared
-	}
-	return nil
 }

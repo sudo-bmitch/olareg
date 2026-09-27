@@ -12,502 +12,68 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package store
+package backend
 
-import (
-	"bytes"
-	"encoding/json"
-	"errors"
-	"fmt"
-	"io"
-	"io/fs"
-	"iter"
-	"log/slog"
-	"os"
-	"path/filepath"
-	"slices"
-	"strings"
-	"sync"
-	"time"
+// import (
+// 	"context"
+// 	"encoding/json"
+// 	"errors"
+// 	"fmt"
+// 	"io"
+// 	"io/fs"
+// 	"log/slog"
+// 	"os"
+// 	"path/filepath"
+// 	"slices"
+// 	"strings"
+// 	"sync"
+// 	"time"
 
-	"github.com/olareg/olareg/config"
-	"github.com/olareg/olareg/internal/cache"
-	"github.com/olareg/olareg/types"
-	digest "github.com/sudo-bmitch/oci-digest"
-)
+// 	digest "github.com/sudo-bmitch/oci-digest"
 
-// dir is the on disk representation of an OCI Layout.
-// When holding multiple mutex locks simultaneously, always start from fine grain lock first (dirRepoUpload, then dirRepo, then dir) to avoid deadlocks.
+// 	"github.com/olareg/olareg/config"
+// 	"github.com/olareg/olareg/internal/cache"
+// 	"github.com/olareg/olareg/internal/sloghandle"
+// 	"github.com/olareg/olareg/types"
+// )
 
-type dir struct {
-	mu    sync.Mutex
-	root  string
-	repos *cache.Cache[string, *dirRepo] // TODO: can probably drop this
-	log   *slog.Logger
-	conf  config.ConfigStorage
-}
+// type dir struct {
+// 	mu    sync.Mutex
+// 	wg    sync.WaitGroup
+// 	root  string
+// 	repos *cache.Cache[string, *dirRepo]
+// 	log   *slog.Logger
+// 	conf  config.Config
+// 	stop  chan struct{}
+// }
 
-type dirRepo struct {
-	mu      sync.Mutex
-	timeMod time.Time // TODO: can probably drop this
-	name    string
-	path    string
-	exists  bool
-	index   types.LayoutIndex // TODO: can probably drop this
-	uploads []*dirRepoUpload  // TODO: can probably drop this
-	log     *slog.Logger
-	conf    config.ConfigStorage
-}
+// type dirRepo struct {
+// 	mu        sync.Mutex
+// 	wg        sync.WaitGroup
+// 	wgBlock   chan struct{}
+// 	timeCheck time.Time
+// 	timeMod   time.Time
+// 	name      string
+// 	path      string
+// 	exists    bool
+// 	index     types.LayoutIndex
+// 	uploads   *cache.Cache[string, *dirRepoUpload]
+// 	log       *slog.Logger
+// 	conf      config.Config
+// }
 
-type dirRepoUpload struct {
-	mu       sync.Mutex
-	fh       *os.File
-	repoPath string
-	tempName string
-	dr       *dirRepo
-}
-
-func newDir(conf config.ConfigStorage, opts ...Opts) (Store, error) {
-	op := OptParams{
-		log: slog.New(slog.DiscardHandler),
-	}
-	for _, opt := range opts {
-		opt(&op)
-	}
-	cacheOpts := cache.Opts[string, *dirRepo]{
-		PruneFn: func(_ string, dr *dirRepo) error {
-			if len(dr.uploads) > 0 {
-				return fmt.Errorf("uploads in progress")
-			}
-			return dr.Close()
-		},
-	}
-	d := &dir{
-		root:  conf.RootDir,
-		repos: cache.New[string, *dirRepo](cacheOpts),
-		log:   op.log,
-		conf:  conf,
-	}
-	return d, nil
-}
-
-// RepoGet returns a repo.
-// The returned interface should remain valid until [Repo.Close] is called.
-func (d *dir) RepoGet(repo string) (Repo, error) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	if dr, err := d.repos.Get(repo); err == nil {
-		return dr, nil
-	}
-	// TODO: minimial validation since this is done in backend
-	if stringsHasAny(strings.Split(repo, "/"), indexFile, layoutFile, blobsDir) {
-		return nil, fmt.Errorf("repo %s cannot contain %s, %s, or %s%.0w", repo, indexFile, layoutFile, blobsDir, types.ErrRepoNotAllowed)
-	}
-	if !filepath.IsLocal(repo) {
-		return nil, fmt.Errorf("repo %s must be a relative path%.0w", repo, types.ErrRepoNotAllowed)
-	}
-	dr := dirRepo{
-		path: filepath.Join(d.root, repo),
-		name: repo,
-		conf: d.conf,
-		index: types.LayoutIndex{
-			Index: types.Index{
-				SchemaVersion: 2,
-				MediaType:     types.MediaTypeOCI1ManifestList,
-				Manifests:     []types.Descriptor{},
-			},
-		},
-		log:     d.log,
-		uploads: []*dirRepoUpload{},
-	}
-	// verify layout and load the index
-	err := dr.layoutLoad()
-	if err != nil && !errors.Is(err, types.ErrNotFound) {
-		return nil, err
-	}
-	d.repos.Set(repo, &dr)
-	return &dr, nil
-}
-
-// Close indicates the store is no longer needed and may free up any resources.
-// Future calls to the store or any contained repos may fail.
-func (d *dir) Close() error {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	err := d.repos.DeleteAll()
-	if err != nil {
-		return err
-	}
-	return nil
-}
-
-// IndexGet returns the top level index.json file contents.
-func (dr *dirRepo) IndexGet() (types.LayoutIndex, error) {
-	dr.mu.Lock()
-	defer dr.mu.Unlock()
-	err := dr.layoutLoad()
-	if err != nil && !errors.Is(err, types.ErrNotFound) {
-		return types.LayoutIndex{}, err
-	}
-	ic := dr.index.Copy()
-	return ic, nil
-}
-
-// IndexSet returns the top level index.json file contents.
-func (dr *dirRepo) IndexSet(i types.LayoutIndex) error {
-	dr.mu.Lock()
-	defer dr.mu.Unlock()
-	dr.index = i.Copy()
-	return dr.layoutSave()
-}
-
-// BlobCreate is used to create a new blob.
-func (dr *dirRepo) BlobCreate() (BlobCreator, error) {
-	// create a temp file in the repo blob store, under an upload folder
-	tmpDir := filepath.Join(dr.path, uploadDir)
-	uploadFH, err := os.Stat(tmpDir)
-	if err == nil && !uploadFH.IsDir() {
-		return nil, fmt.Errorf("upload location %s is not a directory", tmpDir)
-	}
-	if err != nil {
-		//#nosec G301 directory permissions are intentionally world readable.
-		err = os.MkdirAll(tmpDir, 0o755)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create upload directory %s: %w", tmpDir, err)
-		}
-	}
-	tf, err := os.CreateTemp(tmpDir, "upload.*")
-	if err != nil {
-		return nil, fmt.Errorf("failed to create temp file in %s: %w", tmpDir, err)
-	}
-	bc := &dirRepoUpload{
-		fh:       tf,
-		repoPath: dr.path,
-		tempName: tf.Name(),
-		dr:       dr,
-	}
-	dr.timeMod = time.Now()
-	dr.uploads = append(dr.uploads, bc)
-	return bc, nil
-}
-
-// BlobDelete removes an entry from the CAS.
-func (dr *dirRepo) BlobDelete(d digest.Digest) error {
-	if d.IsZero() {
-		return fmt.Errorf("invalid digest: %s", d.String())
-	}
-	filename := filepath.Join(dr.path, blobsDir, d.Algorithm().String(), d.Encoded())
-	fi, err := os.Stat(filename)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return fmt.Errorf("failed to stat %s: %w", d.String(), types.ErrNotFound)
-		}
-		return fmt.Errorf("failed to stat %s: %w", d.String(), err)
-	}
-	if fi.IsDir() {
-		return fmt.Errorf("invalid blob %s: %s is a directory", d.String(), filename)
-	}
-	dr.log.Debug("blob deleted", "repo", dr.name, "digest", d.String())
-	err = os.Remove(filename)
-	return err
-}
-
-// BlobGet returns a reader to an entry from the CAS.
-func (dr *dirRepo) BlobGet(d digest.Digest) (io.ReadSeekCloser, error) {
-	if d.IsZero() {
-		return nil, fmt.Errorf("invalid digest: %s", d.String())
-	}
-	fh, err := os.Open(filepath.Join(dr.path, blobsDir, d.Algorithm().String(), d.Encoded()))
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, fmt.Errorf("failed to load digest %s: %w", d.String(), types.ErrNotFound)
-		}
-		return nil, fmt.Errorf("failed to load digest %s: %w", d.String(), err)
-	}
-	return fh, nil
-}
-
-// BlobMeta returns metadata on a blob.
-func (dr *dirRepo) BlobMeta(d digest.Digest) (BlobMeta, error) {
-	if d.IsZero() {
-		return BlobMeta{}, fmt.Errorf("invalid digest: %s", d.String())
-	}
-	fi, err := os.Stat(filepath.Join(dr.path, blobsDir, d.Algorithm().String(), d.Encoded()))
-	if err != nil {
-		if os.IsNotExist(err) {
-			return BlobMeta{}, fmt.Errorf("failed to load digest %s: %w", d.String(), types.ErrNotFound)
-		}
-		return BlobMeta{}, fmt.Errorf("failed to load digest %s: %w", d.String(), err)
-	}
-	m := BlobMeta{}
-	m.Mod = fi.ModTime()
-	m.Size = fi.Size()
-	return m, nil
-}
-
-// Walk is used to traverse the contents of a repo.
-// If a list of descriptors is not provided, the index.json contents will be traversed.
-// Descriptors that are not found will be silently skipped.
-func (dr *dirRepo) Walk(depth types.ManifestParseDepth, retReader bool, descList ...types.Descriptor) iter.Seq[WalkStep] {
-	if len(descList) == 0 {
-		dr.mu.Lock()
-		descList = make([]types.Descriptor, len(dr.index.Manifests))
-		for i, d := range dr.index.Manifests {
-			descList[i] = d.Copy()
-		}
-		dr.mu.Unlock()
-	}
-	return func(yield func(WalkStep) bool) {
-		for i := 0; i < len(descList); i++ { // descList may be appended in this loop
-			d := descList[i]
-			bm, err := dr.BlobMeta(d.Digest)
-			if err != nil {
-				continue
-			}
-			step := WalkStep{Desc: d, Meta: BlobMeta{Mod: bm.Mod, Size: bm.Size}}
-			// always read manifests to parse later
-			var raw []byte
-			if types.MediaTypeManifest(d.MediaType) {
-				rdr, err := dr.BlobGet(d.Digest)
-				if err != nil {
-					continue
-				}
-				raw, err = io.ReadAll(rdr)
-				_ = rdr.Close()
-				if err != nil {
-					continue
-				}
-				if retReader {
-					step.Rdr = types.BytesReadCloser{Reader: bytes.NewReader(raw)}
-				}
-			} else if retReader {
-				// reader requested for blobs
-				step.Rdr, err = dr.BlobGet(d.Digest)
-			}
-			if !yield(step) {
-				return
-			}
-			if len(raw) > 0 {
-				addDesc, _ := types.ManifestParseDescriptors(raw, d, depth)
-				if len(addDesc) > 0 {
-					descList = append(descList, addDesc...)
-				}
-			}
-		}
-	}
-}
-
-// GC (garbage collect) cleans unmarked blobs that have been created before the cutoff time.
-func (dr *dirRepo) GC(cutoff time.Time, keepDig map[digest.Digest]bool) error {
-	algoDirs, err := os.ReadDir(filepath.Join(dr.path, blobsDir))
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil
-		}
-		return fmt.Errorf("failed to read dir %s: %v", filepath.Join(dr.path, blobsDir), err)
-	}
-	for _, algoDir := range algoDirs {
-		if !algoDir.IsDir() {
-			continue
-		}
-		encodeFiles, err := os.ReadDir(filepath.Join(dr.path, blobsDir, algoDir.Name()))
-		if err != nil {
-			return fmt.Errorf("failed to read dir %s: %v", filepath.Join(dr.path, blobsDir, algoDir.Name()), err)
-		}
-		for _, encodeFile := range encodeFiles {
-			d, err := digest.Parse(algoDir.Name() + ":" + encodeFile.Name())
-			if err != nil || keepDig[d] {
-				// skip unparsable digests and those on the keep list
-				continue
-			}
-			filename := filepath.Join(dr.path, blobsDir, algoDir.Name(), encodeFile.Name())
-			fi, err := os.Stat(filename)
-			if err != nil || fi.ModTime().After(cutoff) {
-				// skip nodes that cannot be stat or were written after the cutoff
-				continue
-			}
-			// delete is a best effort
-			_ = os.Remove(filename)
-		}
-	}
-	return nil
-}
-
-// Close indicates the repo is no longer being accessed and resources may be freed.
-func (dr *dirRepo) Close() error {
-	return nil
-}
-
-// layoutLoad ingests the index.json and oci-layout file, verifying the contents.
-// This may return a [types.ErrNotFound] when either is missing.
-// All other errors should block working with the repo directory.
-func (dr *dirRepo) layoutLoad() error {
-	// verify layout
-	if !dr.exists {
-		//#nosec G304 internal method is only called with filenames within admin provided path.
-		layoutBytes, err := os.ReadFile(filepath.Join(dr.path, layoutFile))
-		if err != nil {
-			if errors.Is(err, fs.ErrNotExist) {
-				return fmt.Errorf("%v%.0w", err, types.ErrNotFound)
-			}
-			return err
-		}
-		if !layoutVerify(layoutBytes) {
-			return fmt.Errorf("invalid %s contents", filepath.Join(dr.path, layoutFile))
-		}
-		dr.exists = true
-	}
-	// load index.json
-	fh, err := os.Open(filepath.Join(dr.path, indexFile))
-	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return fmt.Errorf("%v%.0w", err, types.ErrNotFound)
-		}
-		return err
-	}
-	defer fh.Close()
-	stat, err := fh.Stat()
-	if err != nil {
-		return err
-	}
-	modTime := stat.ModTime()
-	if modTime.After(dr.timeMod) {
-		err = json.NewDecoder(fh).Decode(&dr.index)
-		if err != nil {
-			return err
-		}
-		dr.timeMod = modTime
-	}
-	return nil
-}
-
-// layoutSave writes the index.json and oci-layout if needed.
-// The oci-layout only needs to be written when dr.exists is false.
-func (dr *dirRepo) layoutSave() error {
-	if !dr.exists {
-		l := types.Layout{Version: types.LayoutVersion}
-		lJSON, err := json.Marshal(l)
-		if err != nil {
-			return err
-		}
-		err = os.WriteFile(filepath.Join(dr.path, layoutFile), lJSON, 0x644)
-		if err != nil {
-			return err
-		}
-		dr.exists = true
-	}
-	fh, err := os.CreateTemp(dr.path, "index.json.*")
-	if err != nil {
-		return err
-	}
-	defer fh.Close()
-	err = json.NewEncoder(fh).Encode(dr.index)
-	if err != nil {
-		//#nosec G703 repo path has been cleaned
-		_ = os.Remove(fh.Name())
-		return err
-	}
-	//#nosec G703 repo path has been cleaned
-	err = os.Rename(fh.Name(), filepath.Join(dr.path, indexFile))
-	if err != nil {
-		//#nosec G703 repo path has been cleaned
-		_ = os.Remove(fh.Name())
-		return err
-	}
-	fi, err := fh.Stat()
-	if err != nil {
-		return fmt.Errorf("failed to stat index.json for tracking mod time: %w", err)
-	}
-	dr.timeMod = fi.ModTime()
-	return nil
-}
-
-// Writer is used to push the blob content.
-func (dru *dirRepoUpload) Write(p []byte) (n int, err error) {
-	dru.mu.Lock()
-	defer dru.mu.Unlock()
-	if dru.fh == nil {
-		return 0, fmt.Errorf("writer is closed")
-	}
-	n, err = dru.fh.Write(p)
-	return n, err
-}
-
-// Reader returns a reader from the start of the blob.
-// The reader should always be fully consumed before calling Write again.
-func (dru *dirRepoUpload) Reader() io.Reader {
-	dru.mu.Lock()
-	defer dru.mu.Unlock()
-	if dru.tempName == "" {
-		return nil
-	}
-	rdr, err := os.Open(dru.tempName)
-	if err != nil {
-		return nil
-	}
-	return rdr
-}
-
-// Save is used to store the blob to a given digest value.
-// The store is not required to verify this value.
-func (dru *dirRepoUpload) Save(d digest.Digest) error {
-	if d.IsZero() {
-		return types.ErrDigestInvalid
-	}
-	dru.mu.Lock()
-	defer dru.mu.Unlock()
-	err := dru.fh.Close()
-	dru.fh = nil
-	if err != nil {
-		return errors.Join(err, os.Remove(dru.tempName))
-	}
-	// move temp file to blob store
-	tgtDir := filepath.Join(dru.repoPath, blobsDir, d.Algorithm().String())
-	fi, err := os.Stat(tgtDir)
-	if err == nil && !fi.IsDir() {
-		return errors.Join(fmt.Errorf("failed to move file to blob storage, %s is not a directory", tgtDir),
-			os.Remove(dru.tempName))
-	}
-	if err != nil {
-		//#nosec G301 directory permissions are intentionally world readable.
-		err = os.MkdirAll(tgtDir, 0o755)
-		if err != nil {
-			return errors.Join(fmt.Errorf("unable to create blob storage directory %s: %w", tgtDir, err),
-				os.Remove(dru.tempName))
-		}
-	}
-	blobName := filepath.Join(tgtDir, d.Encoded())
-	err = errors.Join(os.Rename(dru.tempName, blobName))
-	dru.tempName = ""
-	dr := dru.dr
-	dr.mu.Lock()
-	defer dr.mu.Unlock()
-	dr.uploads = slices.DeleteFunc(dr.uploads, func(cur *dirRepoUpload) bool { return cur == dru })
-	dru.dr.log.Debug("blob created", "repo", dru.dr.name, "digest", d.String(), "err", err)
-	return err
-}
-
-// Cancel is used to stop an upload.
-func (dru *dirRepoUpload) Cancel() error {
-	dru.mu.Lock()
-	defer dru.mu.Unlock()
-	errs := []error{}
-	if dru.fh != nil {
-		if err := dru.fh.Close(); err != nil {
-			errs = append(errs, err)
-		}
-	}
-	if dru.tempName != "" {
-		if err := os.Remove(dru.tempName); err != nil && !errors.Is(err, fs.ErrNotExist) {
-			errs = append(errs, err)
-		}
-	}
-	dr := dru.dr
-	dr.mu.Lock()
-	defer dr.mu.Unlock()
-	dr.uploads = slices.DeleteFunc(dr.uploads, func(cur *dirRepoUpload) bool { return cur == dru })
-	return errors.Join(errs...)
-}
+// type dirRepoUpload struct {
+// 	mu        sync.Mutex
+// 	fh        *os.File
+// 	alg       digest.Algorithm
+// 	w         digest.Writer
+// 	size      int64
+// 	expect    digest.Digest
+// 	path      string
+// 	filename  string
+// 	dr        *dirRepo
+// 	sessionID string
+// }
 
 // // NewDir returns a directory store.
 // func NewDir(conf config.Config, opts ...Opts) Store {
@@ -828,6 +394,24 @@ func (dru *dirRepoUpload) Cancel() error {
 // 	if _, err := dr.uploads.Get(sessionID); err == nil {
 // 		return nil, "", fmt.Errorf("session ID collision")
 // 	}
+// 	// create a temp file in the repo blob store, under an upload folder
+// 	tmpDir := filepath.Join(dr.path, uploadDir)
+// 	uploadFH, err := os.Stat(tmpDir)
+// 	if err == nil && !uploadFH.IsDir() {
+// 		return nil, "", fmt.Errorf("upload location %s is not a directory", tmpDir)
+// 	}
+// 	if err != nil {
+// 		//#nosec G301 directory permissions are intentionally world readable.
+// 		err = os.MkdirAll(tmpDir, 0o755)
+// 		if err != nil {
+// 			return nil, "", fmt.Errorf("failed to create upload directory %s: %w", tmpDir, err)
+// 		}
+// 	}
+// 	tf, err := os.CreateTemp(tmpDir, "upload.*")
+// 	if err != nil {
+// 		return nil, "", fmt.Errorf("failed to create temp file in %s: %w", tmpDir, err)
+// 	}
+// 	filename := tf.Name()
 // 	// start a new digester with the appropriate algo
 // 	w := digest.NewWriter(tf, conf.algo)
 // 	bc := &dirRepoUpload{
@@ -1281,4 +865,13 @@ func (dru *dirRepoUpload) Cancel() error {
 // 		return fmt.Errorf("failed to compute digest: %w", err)
 // 	}
 // 	return fmt.Errorf("digest mismatch, expected %s, received %s", expect.String(), d.String())
+// }
+
+// func stringsHasAny(list []string, check ...string) bool {
+// 	for _, c := range check {
+// 		if slices.Contains(list, c) {
+// 			return true
+// 		}
+// 	}
+// 	return false
 // }

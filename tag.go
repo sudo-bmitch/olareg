@@ -28,7 +28,7 @@ import (
 
 func (s *Server) tagList(repoStr string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		repo, err := s.store.RepoGet(r.Context(), repoStr)
+		repo, err := s.backend.RepoGet(repoStr)
 		if err != nil {
 			if errors.Is(err, types.ErrRepoNotAllowed) {
 				w.WriteHeader(http.StatusBadRequest)
@@ -39,12 +39,10 @@ func (s *Server) tagList(repoStr string) http.HandlerFunc {
 			s.log.Info("failed to get repo", "err", err, "repo", repoStr)
 			return
 		}
-		index, err := repo.IndexGet()
-		repo.Done()
+		tags, err := repo.TagList()
 		if err != nil {
-			// TODO: handle different errors (perm denied, not found, internal server error)
-			w.WriteHeader(http.StatusNotFound)
-			_ = types.ErrRespJSON(w, types.ErrInfoNameUnknown("repository does not exist"))
+			w.WriteHeader(http.StatusInternalServerError)
+			s.log.Info("failed to list tags", "err", err, "repo", repoStr)
 			return
 		}
 		last := r.URL.Query().Get("last")
@@ -53,9 +51,9 @@ func (s *Server) tagList(repoStr string) http.HandlerFunc {
 			Name: repoStr,
 			Tags: []string{},
 		}
-		for _, d := range index.Manifests {
-			if d.Annotations != nil && d.Annotations[types.AnnotRefName] != "" && strings.Compare(last, d.Annotations[types.AnnotRefName]) < 0 {
-				tl.Tags = append(tl.Tags, d.Annotations[types.AnnotRefName])
+		for t, _ := range tags {
+			if strings.Compare(last, t) < 0 {
+				tl.Tags = append(tl.Tags, t)
 			}
 		}
 		sort.Strings(tl.Tags)

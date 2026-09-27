@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"github.com/olareg/olareg/config"
+	"github.com/olareg/olareg/internal/backend"
 	"github.com/olareg/olareg/internal/cache"
 	"github.com/olareg/olareg/internal/httplog"
 	"github.com/olareg/olareg/internal/sloghandle"
@@ -41,9 +42,13 @@ var (
 	LogTrace = slog.LevelDebug - 4
 )
 
+func init() {
+	store.RegisterDefaults()
+}
+
 // New returns a Server.
 // Ensure the resource is cleaned up with either [Server.Close] or [Server.Shutdown].
-func New(conf config.Config) *Server {
+func New(conf config.Config) (*Server, error) {
 	conf.SetDefaults()
 	s := &Server{
 		conf: conf,
@@ -61,19 +66,18 @@ func New(conf config.Config) *Server {
 	if s.log == nil {
 		s.log = slog.New(sloghandle.Discard)
 	}
-	switch s.conf.Storage.StoreType {
-	case config.StoreMem:
-		s.store = store.NewMem(s.conf, store.WithLog(s.log))
-	case config.StoreDir:
-		s.store = store.NewDir(s.conf, store.WithLog(s.log))
+	if back, err := backend.New(conf); err == nil {
+		s.backend = back
+	} else {
+		return nil, err
 	}
-	return s
+	return s, nil
 }
 
 type Server struct {
 	mu            sync.Mutex
 	conf          config.Config
-	store         store.Store
+	backend       *backend.Backend
 	log           *slog.Logger
 	httpServer    *http.Server
 	referrerCache *cache.Cache[referrerKey, referrerResponses]
@@ -85,13 +89,13 @@ type rateLimitEntry struct {
 	count int
 }
 
-// Close is used to release the backend store resources.
+// Close is used to release the backend resources.
 func (s *Server) Close() error {
-	if s.store == nil {
-		return fmt.Errorf("backend store was already closed")
+	if s.backend == nil {
+		return fmt.Errorf("backend was already closed")
 	}
-	err := s.store.Close()
-	s.store = nil
+	err := s.backend.Close()
+	s.backend = nil
 	return err
 }
 
@@ -140,17 +144,17 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if s.store != nil {
-		err = s.store.Close()
-		s.store = nil
+	if s.backend != nil {
+		err = s.backend.Close()
+		s.backend = nil
 	}
 	return err
 }
 
 // ServeHTTP handles requests to the OCI registry.
 func (s *Server) ServeHTTP(resp http.ResponseWriter, req *http.Request) {
-	if s.store == nil {
-		s.log.Error("ServeHTTP called without a backend store")
+	if s.backend == nil {
+		s.log.Error("ServeHTTP called without a backend")
 		resp.WriteHeader(http.StatusInternalServerError)
 		return
 	}
