@@ -117,3 +117,7 @@ func TestMediaTypeAccepts(t *testing.T) {
 		})
 	}
 }
+
+// TODO: test media type detect
+
+// TODO: test various media type classifiers

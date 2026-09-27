@@ -16,6 +16,8 @@ package types
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"maps"
 	"slices"
 
@@ -68,7 +70,7 @@ type Manifest struct {
 	Annotations map[string]string `json:"annotations,omitempty"`
 }
 
-// Copy returns a deep copy of the index to avoid data races
+// Copy returns a deep copy of the index.
 func (i Index) Copy() Index {
 	i2 := i
 	i2.Manifests = make([]Descriptor, len(i.Manifests))
@@ -102,6 +104,70 @@ func (i *Index) GetByAnnotation(key, val string) (Descriptor, error) {
 	return dRet, ErrNotFound
 }
 
+// Paginate splits an index into one or more indexes for paginated responses.
+// Only the Manifests are split, all other fields are copied.
+// This will fail if a single entry still exceeds the limit.
+func (i Index) Paginate(limit int64) ([]byte, int, error) {
+	lower, upper := 1, len(i.Manifests)
+	out, err := json.Marshal(i)
+	if err != nil {
+		return nil, 0, err
+	}
+	if upper == 0 || int64(len(out)) <= limit {
+		return out, -1, nil
+	}
+	origList := i.Manifests
+	errs := []error{}
+	// skip any descriptors that exceed the limit by themselves
+	for {
+		i.Manifests = origList[:1]
+		out, err = json.Marshal(i)
+		if err != nil {
+			return nil, 0, err
+		}
+		if int64(len(out)) > limit {
+			errs = append(errs, fmt.Errorf("single descriptor greater than limit: %s", origList[0].Digest))
+			origList = origList[1:]
+		} else {
+			break
+		}
+	}
+	try := upper
+	for lower+1 < upper {
+		// quickly narrow down the target index based on percentage of the limit used in last guess
+		diff := -1 // avoid try being set to the same value twice when close to target
+		if try == lower {
+			diff = 1
+		}
+		try = int(float64(try)*float64(limit)/float64(len(out))) + diff
+		// switch to binary search if the estimate breaks down (from unequally sized descriptors)
+		if try <= lower || try >= upper {
+			try = lower + (upper-lower+1)/2
+		}
+		i.Manifests = origList[:try]
+		out, err = json.Marshal(i)
+		if err != nil {
+			return nil, 0, err
+		}
+		if int64(len(out)) <= limit {
+			lower = try
+		} else {
+			upper = try
+		}
+	}
+	if try != lower {
+		i.Manifests = origList[:lower]
+		out, err = json.Marshal(i)
+		if err != nil {
+			return nil, 0, err
+		}
+	}
+	if len(errs) > 0 {
+		return out, try, errors.Join(errs...)
+	}
+	return out, try, nil
+}
+
 type referrerParse struct {
 	MediaType    string            `json:"mediaType,omitempty"`
 	ArtifactType string            `json:"artifactType,omitempty"`
@@ -113,6 +179,7 @@ type referrerParse struct {
 // ManifestReferrerDescriptor parses a manifest to generate the descriptor used in the referrer response.
 // Two descriptors are returned, the subject, and the entry for the referrers response.
 // The descriptor should be provided with a valid MediaType and Digest, otherwise they will be generated as a best effort.
+// If the manifest does not contain a subject, [ErrNotFOund] is returned.
 func ManifestReferrerDescriptor(raw []byte, d Descriptor) (Descriptor, Descriptor, error) {
 	rd := d
 	subject := Descriptor{}
@@ -144,3 +211,38 @@ func ManifestReferrerDescriptor(raw []byte, d Descriptor) (Descriptor, Descripto
 	rd.Annotations = referrer.Annotations
 	return subject, rd, nil
 }
+
+// ManifestParseDescriptors reads the contents of a manifest and returns the contained descriptors up to the requested depth.
+// Note that the subject descriptor is not returned at any depth.
+// TODO: add tests
+func ManifestParseDescriptors(raw []byte, d Descriptor, depth ManifestParseDepth) ([]Descriptor, error) {
+	switch d.MediaType {
+	case MediaTypeOCI1ManifestList, MediaTypeDocker2ManifestList:
+		if depth >= ParseManifests {
+			ind := Index{}
+			err := json.Unmarshal(raw, &ind)
+			if err != nil {
+				return nil, err
+			}
+			return ind.Manifests, nil
+		}
+	case MediaTypeOCI1Manifest, MediaTypeDocker2Manifest:
+		if depth >= ParseBlobs {
+			man := Manifest{}
+			err := json.Unmarshal(raw, &man)
+			if err != nil {
+				return nil, err
+			}
+			return append(man.Layers, man.Config), nil
+		}
+	}
+	return nil, nil
+}
+
+type ManifestParseDepth int
+
+const (
+	ParseNone      ManifestParseDepth = iota // Do not parse any descriptors
+	ParseManifests                           // Parse and return only descriptors to other manifests in the index
+	ParseBlobs                               // Parse and return descriptors to manifest and other blobs
+)
