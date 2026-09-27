@@ -116,11 +116,6 @@ olareg serve --tls-cert host.pem --tls-key host.key --port 443
 }
 
 func (opts *serveOpts) run(cmd *cobra.Command, args []string) error {
-	var storeType config.Store
-	err := storeType.UnmarshalText([]byte(opts.storeType))
-	if err != nil {
-		return fmt.Errorf("unable to parse store type %s: %w", opts.storeType, err)
-	}
 	conf := config.Config{
 		HTTP: config.ConfigHTTP{
 			Addr:     fmt.Sprintf("%s:%d", opts.addr, opts.port),
@@ -128,7 +123,7 @@ func (opts *serveOpts) run(cmd *cobra.Command, args []string) error {
 			KeyFile:  opts.tlsKey,
 		},
 		Storage: config.ConfigStorage{
-			StoreType: storeType,
+			StoreType: opts.storeType,
 			RootDir:   opts.storeDir,
 			ReadOnly:  &opts.storeRO,
 			GC: config.ConfigGC{
@@ -169,12 +164,16 @@ func (opts *serveOpts) run(cmd *cobra.Command, args []string) error {
 				logins[userPassSplit[0]] = userPassSplit[1]
 			}
 		}
+		var err error
 		conf.Auth, err = config.NewAuthBasicStatic(logins, opts.authStaticAnon, config.WithAuthSlog(opts.root.log))
 		if err != nil {
 			return fmt.Errorf("failed to setup static auth: %w", err)
 		}
 	}
-	s := olareg.New(conf)
+	s, err := olareg.New(conf)
+	if err != nil {
+		return fmt.Errorf("failed to setup server: %w", err)
+	}
 	// include signal handler to gracefully shutdown
 	ctx := cmd.Context()
 	if ctx == nil {
