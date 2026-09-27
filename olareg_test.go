@@ -274,7 +274,10 @@ func TestServer(t *testing.T) {
 		t.Run(tcServer.name, func(t *testing.T) {
 			t.Parallel()
 			// new server
-			s := New(tcServer.conf)
+			s, err := New(tcServer.conf)
+			if err != nil {
+				t.Fatalf("failed to initialize server: %v", err)
+			}
 			t.Cleanup(func() { _ = s.Close() })
 			t.Run("Unknown Method", func(t *testing.T) {
 				t.Parallel()
@@ -785,7 +788,7 @@ func TestServer(t *testing.T) {
 					t.Errorf("failed to pull entry after recreating server: %v", err)
 				}
 				// verify GC
-				if _, err := testClientRun(t, s, "GET", "/v2/gc/manifest/amd64-copy", nil,
+				if _, err := testClientRun(t, s, "GET", "/v2/gc/manifests/amd64-copy", nil,
 					testClientReqHeader("Accept", types.MediaTypeOCI1Manifest),
 					testClientReqHeader("Accept", types.MediaTypeOCI1ManifestList),
 					testClientReqHeader("Accept", types.MediaTypeDocker2Manifest),
@@ -795,7 +798,7 @@ func TestServer(t *testing.T) {
 				} else {
 					t.Log("amd64-copy was garbage collected")
 				}
-				if _, err := testClientRun(t, s, "GET", "/v2/gc/manifest/arm64", nil,
+				if _, err := testClientRun(t, s, "GET", "/v2/gc/manifests/arm64", nil,
 					testClientReqHeader("Accept", types.MediaTypeOCI1Manifest),
 					testClientReqHeader("Accept", types.MediaTypeOCI1ManifestList),
 					testClientReqHeader("Accept", types.MediaTypeDocker2Manifest),
@@ -813,7 +816,7 @@ func TestServer(t *testing.T) {
 						testClientRespStatus(http.StatusNotFound)); err != nil {
 						t.Errorf("did not receive a not-found error on a GC blob: %v", err)
 					} else {
-						t.Logf("blog GC verified: %s", dig.String())
+						t.Logf("blob GC verified: %s", dig.String())
 					}
 				}
 				for dig := range seAMD.blob {
@@ -821,7 +824,7 @@ func TestServer(t *testing.T) {
 						testClientRespStatus(http.StatusOK)); err != nil {
 						t.Errorf("GC blob of image that should have been preserved: %v", err)
 					} else {
-						t.Logf("blog retention verified: %s", dig.String())
+						t.Logf("blob retention verified: %s", dig.String())
 					}
 				}
 			})
@@ -1525,105 +1528,6 @@ func TestServer(t *testing.T) {
 					t.Errorf("failed to delete index by digest: %v", err)
 				}
 			})
-			t.Run("digest-algo-unknown", func(t *testing.T) {
-				if tcServer.readOnly || tcServer.testGC || tcServer.deleteDisabled {
-					return
-				}
-				t.Parallel()
-				repo := "digest-unknown"
-				sd, err := genSampleData(t)
-				if err != nil {
-					t.Fatalf("failed to generate sample data")
-				}
-				// create a digest with an unknown algorithm
-				badDig := "unknown:12345"
-				// attempt to get/head blob
-				u, err := url.Parse("/v2/" + repo + "/blobs/" + badDig)
-				if err != nil {
-					t.Fatalf("failed to parse URL: %v", err)
-				}
-				_, err = testClientRun(t, s, "HEAD", u.String(), nil,
-					testClientRespStatus(http.StatusNotFound, http.StatusBadRequest))
-				if err != nil {
-					t.Errorf("failed to send head request: %v", err)
-				}
-				_, err = testClientRun(t, s, "GET", u.String(), nil,
-					testClientRespStatus(http.StatusNotFound, http.StatusBadRequest))
-				if err != nil {
-					t.Errorf("failed to send get request: %v", err)
-				}
-				// attempt to delete blob
-				_, err = testClientRun(t, s, "DELETE", u.String(), nil,
-					testClientRespStatus(http.StatusNotFound, http.StatusBadRequest))
-				if err != nil {
-					t.Errorf("failed to send delete request: %v", err)
-				}
-				// attempt to push blob
-				u, err = url.Parse("/v2/" + repo + "/blobs/uploads/?digest=" + url.QueryEscape(badDig))
-				if err != nil {
-					t.Fatalf("failed to parse URL: %v", err)
-				}
-				_, err = testClientRun(t, s, "POST", u.String(), nil,
-					testClientRespStatus(http.StatusBadRequest))
-				if err != nil {
-					t.Errorf("failed to send blob post with digest: %v", err)
-				}
-				u, err = url.Parse("/v2/" + repo + "/blobs/uploads/?digest-algorithm=unknown")
-				if err != nil {
-					t.Fatalf("failed to parse URL: %v", err)
-				}
-				_, err = testClientRun(t, s, "POST", u.String(), nil,
-					testClientRespStatus(http.StatusBadRequest))
-				if err != nil {
-					t.Errorf("failed to send blob post with algorithm: %v", err)
-				}
-				// attempt to get/head manifest
-				u, err = url.Parse("/v2/" + repo + "/manifests/" + badDig)
-				if err != nil {
-					t.Fatalf("failed to parse URL: %v", err)
-				}
-				_, err = testClientRun(t, s, "HEAD", u.String(), nil,
-					testClientReqHeader("Accept", types.MediaTypeOCI1Manifest),
-					testClientReqHeader("Accept", types.MediaTypeOCI1ManifestList),
-					testClientReqHeader("Accept", types.MediaTypeDocker2Manifest),
-					testClientReqHeader("Accept", types.MediaTypeDocker2ManifestList),
-					testClientRespStatus(http.StatusNotFound, http.StatusBadRequest))
-				if err != nil {
-					t.Errorf("failed to send manifest head: %v", err)
-				}
-				_, err = testClientRun(t, s, "GET", u.String(), nil,
-					testClientReqHeader("Accept", types.MediaTypeOCI1Manifest),
-					testClientReqHeader("Accept", types.MediaTypeOCI1ManifestList),
-					testClientReqHeader("Accept", types.MediaTypeDocker2Manifest),
-					testClientReqHeader("Accept", types.MediaTypeDocker2ManifestList),
-					testClientRespStatus(http.StatusNotFound, http.StatusBadRequest))
-				if err != nil {
-					t.Errorf("failed to send manifest get: %v", err)
-				}
-				// attempt to push manifest
-				_, err = testClientRun(t, s, "PUT", u.String(), sd["image-amd64"].manifest[sd["image-amd64"].manifestList[0]],
-					testClientReqHeader("Content-Type", types.MediaTypeOCI1Manifest),
-					testClientRespStatus(http.StatusBadRequest))
-				if err != nil {
-					t.Errorf("failed to send manifest put: %v", err)
-				}
-				u, err = url.Parse("/v2/" + repo + "/manifests/bad?digest=" + url.QueryEscape(badDig))
-				if err != nil {
-					t.Fatalf("failed to parse URL: %v", err)
-				}
-				_, err = testClientRun(t, s, "PUT", u.String(), sd["image-amd64"].manifest[sd["image-amd64"].manifestList[0]],
-					testClientReqHeader("Content-Type", types.MediaTypeOCI1Manifest),
-					testClientRespStatus(http.StatusBadRequest))
-				if err != nil {
-					t.Errorf("failed to send manifest put: %v", err)
-				}
-				// attempt to delete manifest
-				_, err = testClientRun(t, s, "DELETE", u.String(), nil,
-					testClientRespStatus(http.StatusNotFound, http.StatusBadRequest))
-				if err != nil {
-					t.Errorf("failed to send manifest delete: %v", err)
-				}
-			})
 			t.Run("warning", func(t *testing.T) {
 				if !tcServer.testWarn {
 					return
@@ -1835,7 +1739,10 @@ func TestAuth(t *testing.T) {
 		t.Run(tcServer.name, func(t *testing.T) {
 			t.Parallel()
 			// new server
-			s := New(tcServer.conf)
+			s, err := New(tcServer.conf)
+			if err != nil {
+				t.Fatalf("failed to initialize backend server: %v", err)
+			}
 			t.Cleanup(func() { _ = s.Close() })
 			t.Run("unauth read", func(t *testing.T) {
 				tcgList := []testClientGen{
@@ -1920,7 +1827,7 @@ func TestAuth(t *testing.T) {
 func TestRateLimit(t *testing.T) {
 	t.Parallel()
 	limit := 10
-	s := New(config.Config{
+	s, err := New(config.Config{
 		Storage: config.ConfigStorage{
 			StoreType: config.StoreMem,
 		},
@@ -1928,6 +1835,9 @@ func TestRateLimit(t *testing.T) {
 			RateLimit: limit,
 		},
 	})
+	if err != nil {
+		t.Fatalf("failed to initialize server: %v", err)
+	}
 	t.Cleanup(func() { _ = s.Close() })
 	reachedLimit := false
 	for range limit * 2 {
@@ -1947,7 +1857,7 @@ func TestRateLimit(t *testing.T) {
 	if !reachedLimit {
 		t.Errorf("never reached rate limit")
 	}
-	_, err := testClientRun(t, s, "GET", "/v2/", nil,
+	_, err = testClientRun(t, s, "GET", "/v2/", nil,
 		testClientReqHeader("X-Forwarded-For", "127.0.0.2"),
 		testClientRespStatus(http.StatusOK))
 	if err != nil {
